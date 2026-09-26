@@ -1,0 +1,85 @@
+name: Pipeline De Frontend STAN
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Imagen GHCR sin ghcr.io/"
+        required: true
+        type: string
+
+      image_tag:
+        description: "Tag del entorno: development o production"
+        required: true
+        type: string
+
+      node_version:
+        required: false
+        type: string
+        default: "22"
+
+    secrets:
+      coolify_webhook:
+        required: true
+
+      coolify_token:
+        required: true
+
+jobs:
+  validate:
+    name: Validate Next.js application
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec tsc --noEmit
+      - run: pnpm lint
+      - run: pnpm test
+      - run: pnpm build
+
+  docker-and-deploy:
+    name: Build, Push and Deploy
+    runs-on: ubuntu-latest
+    needs: validate
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ inputs.image_name }}:${{ inputs.image_tag }}
+            ghcr.io/${{ inputs.image_name }}:${{ inputs.image_tag }}-${{ github.sha }}
+
+      - name: Deploy in Coolify
+        env:
+          COOLIFY_WEBHOOK: ${{ secrets.coolify_webhook }}
+          COOLIFY_TOKEN: ${{ secrets.coolify_token }}
+        run: |
+          curl --fail --request POST \
+            "$COOLIFY_WEBHOOK" \
+            --header "Authorization: Bearer $COOLIFY_TOKEN"
