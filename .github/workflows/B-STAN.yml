@@ -9,7 +9,7 @@ on:
         type: string
 
       image_tag:
-        description: "Tag del entorno: development o production"
+        description: "Entorno de destino: development o production"
         required: true
         type: string
 
@@ -23,17 +23,88 @@ on:
         type: string
         default: "./Dockerfile"
 
+      healthcheck_url:
+        description: "URL pública no autenticada, por ejemplo https://api-dev.stan.../health/"
+        required: true
+        type: string
+
+      dast_target_url:
+        description: "URL base exclusiva de development para Nuclei y k6"
+        required: false
+        type: string
+        default: ""
+
+      load_test_file:
+        required: false
+        type: string
+        default: "tests/load/k6-script.js"
+
+      run_load_tests:
+        required: false
+        type: boolean
+        default: false
+
+      minimum_coverage:
+        required: false
+        type: number
+        default: 0
+
+      sonar_host_url:
+        description: "URL de SonarQube; no es un secreto"
+        required: false
+        type: string
+        default: ""
+
     secrets:
       coolify_webhook:
         required: true
-
       coolify_token:
         required: true
+      sonar_token:
+        required: false
+
+permissions:
+  contents: read
 
 jobs:
-  test:
-    name: Django tests
+  fast-checks:
+    name: "Phase 1 - Quality & Secret Scan"
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect secrets with Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+
+      - name: Install Ruff
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ruff
+
+      - name: Check formatting
+        run: ruff format --check .
+
+      - name: Run linter
+        run: ruff check .
+
+  test:
+    name: "Phase 2 - Django Tests & Coverage"
+    runs-on: ubuntu-latest
+    needs: fast-checks
+    timeout-minutes: 20
 
     env:
       SECRET_KEY: django-insecure-ci
@@ -53,26 +124,101 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements.txt coverage
 
-      - name: Django check
-        run: python manage.py check
+      - name: Validate Django configuration
+        run: |
+          python manage.py check
+          python manage.py makemigrations --check --dry-run
 
-      - name: Run tests
-        run: python manage.py test
+      - name: Run tests with coverage
+        run: |
+          coverage run --branch manage.py test
+          coverage xml -o coverage.xml
+          coverage report --fail-under=${{ inputs.minimum_coverage }}
 
-  docker:
-    name: Build and push image
+      - name: Upload coverage report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+          if-no-files-found: ignore
+          retention-days: 14
+
+  sonar:
+    name: "Phase 3 - SonarQube Quality Gate"
     runs-on: ubuntu-latest
     needs: test
+    timeout-minutes: 15
+
+    env:
+      SONAR_TOKEN: ${{ secrets.sonar_token }}
+      SONAR_HOST_URL: ${{ inputs.sonar_host_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download coverage report
+        if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-report
+
+      - name: Run SonarQube analysis and Quality Gate
+        if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' }}
+        uses: SonarSource/sonarqube-scan-action@v7
+        env:
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
+        with:
+          args: >-
+            -Dsonar.python.coverage.reportPaths=coverage.xml
+            -Dsonar.qualitygate.wait=true
+
+  dependency-security:
+    name: "Phase 3 - Dependency Security"
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Scan filesystem dependencies and IaC
+        uses: aquasecurity/trivy-action@v0.34.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+  docker:
+    name: "Phase 4 - Build, Scan & Publish Image"
+    runs-on: ubuntu-latest
+    needs: [sonar, dependency-security]
+    timeout-minutes: 30
 
     permissions:
       contents: read
       packages: write
 
+    env:
+      IMAGE: ghcr.io/${{ inputs.image_name }}
+      MUTABLE_TAG: ${{ inputs.image_tag }}
+      IMMUTABLE_TAG: ${{ inputs.image_tag }}-${{ github.sha }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -81,44 +227,52 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ inputs.image_name }}
-          tags: |
-            type=raw,value=${{ inputs.image_tag }}
-            type=raw,value=${{ inputs.image_tag }}-${{ github.sha }}
-
-      - name: Build and push Docker image
+      - name: Build candidate image locally
         uses: docker/build-push-action@v6
         with:
           context: .
           file: ${{ inputs.dockerfile }}
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          load: true
+          push: false
+          tags: |
+            ${{ env.IMAGE }}:${{ env.MUTABLE_TAG }}
+            ${{ env.IMAGE }}:${{ env.IMMUTABLE_TAG }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan candidate container image
+        uses: aquasecurity/trivy-action@v0.34.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ env.IMMUTABLE_TAG }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+      - name: Publish validated image
+        run: |
+          docker push "$IMAGE:$MUTABLE_TAG"
+          docker push "$IMAGE:$IMMUTABLE_TAG"
 
   deploy:
-    name: Deploy ${{ inputs.image_tag }} in Coolify
+    name: "Phase 5 - Deploy ${{ inputs.image_tag }} in Coolify"
     runs-on: ubuntu-latest
     needs: docker
+    timeout-minutes: 15
+
+    concurrency:
+      group: coolify-stan-${{ inputs.image_tag }}
+      cancel-in-progress: false
 
     steps:
-      - name: Validate configuration
+      - name: Validate deployment configuration
         env:
           COOLIFY_WEBHOOK: ${{ secrets.coolify_webhook }}
           COOLIFY_TOKEN: ${{ secrets.coolify_token }}
         run: |
-          test -n "$COOLIFY_WEBHOOK" || {
-            echo "ERROR: COOLIFY_WEBHOOK is not configured"
-            exit 1
-          }
-
-          test -n "$COOLIFY_TOKEN" || {
-            echo "ERROR: COOLIFY_TOKEN is not configured"
-            exit 1
-          }
+          test -n "$COOLIFY_WEBHOOK"
+          test -n "$COOLIFY_TOKEN"
 
       - name: Trigger Coolify deployment
         env:
@@ -126,8 +280,69 @@ jobs:
           COOLIFY_TOKEN: ${{ secrets.coolify_token }}
         run: |
           curl --fail --show-error --silent \
+            --retry 3 \
+            --retry-all-errors \
+            --connect-timeout 10 \
+            --max-time 60 \
             --request POST \
             "$COOLIFY_WEBHOOK" \
             --header "Authorization: Bearer $COOLIFY_TOKEN"
 
-          echo "Coolify deployment triggered successfully."
+      - name: Wait for deployed API health check
+        env:
+          HEALTHCHECK_URL: ${{ inputs.healthcheck_url }}
+        run: |
+          for attempt in {1..30}; do
+            if curl --fail --show-error --silent \
+              --connect-timeout 5 \
+              --max-time 10 \
+              "$HEALTHCHECK_URL" > /dev/null; then
+              echo "API healthy after attempt $attempt."
+              exit 0
+            fi
+
+            echo "Waiting for API... attempt $attempt/30"
+            sleep 5
+          done
+
+          echo "ERROR: API did not become healthy."
+          exit 1
+
+  dast-and-performance:
+    name: "Phase 6 - DAST & Load Tests"
+    runs-on: ubuntu-latest
+    needs: deploy
+    timeout-minutes: 30
+
+    # Solo development: nunca ejecutar DAST automático contra production.
+    if: ${{ inputs.image_tag == 'development' && inputs.dast_target_url != '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: DAST with Nuclei
+        uses: projectdiscovery/nuclei-action@main
+        with:
+          target: ${{ inputs.dast_target_url }}
+          flags: >-
+            -tags headers,exposure,misconfig,cve
+            -severity medium,high,critical
+            -rl 5
+            -c 2
+            -timeout 10
+            -retries 1
+
+      - name: Validate load test script
+        if: ${{ inputs.run_load_tests }}
+        env:
+          LOAD_TEST_FILE: ${{ inputs.load_test_file }}
+        run: test -f "$LOAD_TEST_FILE"
+
+      - name: Run k6 load test
+        if: ${{ inputs.run_load_tests }}
+        uses: grafana/k6-action@v0.3.1
+        with:
+          filename: ${{ inputs.load_test_file }}
+        env:
+          TARGET_URL: ${{ inputs.dast_target_url }}
