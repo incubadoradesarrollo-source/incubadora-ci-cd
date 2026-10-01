@@ -134,7 +134,7 @@ jobs:
           path: coverage.xml
           if-no-files-found: ignore
           retention-days: 14
-
+          
   sonar:
     name: "Phase 3 - SonarQube Quality Gate"
     runs-on: ubuntu-latest
@@ -170,6 +170,10 @@ jobs:
         uses: SonarSource/sonarqube-scan-action@v7
         with:
           args: >-
+            -Dsonar.projectKey=b-stan
+            -Dsonar.projectName=B-STAN
+            -Dsonar.sources=.
+            -Dsonar.exclusions=**/migrations/**,**/tests/**,**/.venv/**,**/venv/**
             -Dsonar.python.coverage.reportPaths=coverage.xml
             -Dsonar.qualitygate.wait=true
 
