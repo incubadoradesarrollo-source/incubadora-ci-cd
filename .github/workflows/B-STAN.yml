@@ -316,26 +316,26 @@ jobs:
 
               const body = `## Hallazgo automático de Trivy
 
-**Paquete:** \`${packageName}\`  
-**Versión instalada:** \`${finding.installedVersion}\`  
-**Versión(es) corregida(s):** \`${fixedVersions}\`  
-**Severidad máxima:** \`${hasCritical ? "CRITICAL" : "HIGH"}\`
+              **Paquete:** \`${packageName}\`  
+              **Versión instalada:** \`${finding.installedVersion}\`  
+              **Versión(es) corregida(s):** \`${fixedVersions}\`  
+              **Severidad máxima:** \`${hasCritical ? "CRITICAL" : "HIGH"}\`
 
-### Vulnerabilidades detectadas
+              ### Vulnerabilidades detectadas
 
-| ID | Severidad | Descripción |
-|---|---|---|
-${vulnerabilityRows}
+              | ID | Severidad | Descripción |
+              |---|---|---|
+              ${vulnerabilityRows}
 
-### Criterios de aceptación
+              ### Criterios de aceptación
 
-- [ ] Actualizar \`${packageName}\` a una versión corregida y compatible.
-- [ ] Ejecutar \`python manage.py test\`.
-- [ ] Ejecutar nuevamente Trivy sin hallazgos HIGH o CRITICAL para este paquete.
-- [ ] Cerrar este issue solo después de verificar el pipeline.
+              - [ ] Actualizar \`${packageName}\` a una versión corregida y compatible.
+              - [ ] Ejecutar \`python manage.py test\`.
+              - [ ] Ejecutar nuevamente Trivy sin hallazgos HIGH o CRITICAL para este paquete.
+              - [ ] Cerrar este issue solo después de verificar el pipeline.
 
----
-_Actualizado automáticamente por Trivy en el commit ${context.sha}._`;
+              ---
+              _Actualizado automáticamente por Trivy en el commit ${context.sha}._`;
 
               const existingIssue = openIssues.find(
                 (issue) => issue.title === title && !issue.pull_request,
