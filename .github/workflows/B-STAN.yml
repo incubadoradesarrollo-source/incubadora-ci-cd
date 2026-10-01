@@ -24,7 +24,7 @@ on:
         default: "./Dockerfile"
 
       healthcheck_url:
-        description: "URL pública no autenticada, por ejemplo https://api-dev.stan.../health/"
+        description: "URL pública no autenticada del health check"
         required: true
         type: string
 
@@ -50,7 +50,7 @@ on:
         default: 0
 
       sonar_host_url:
-        description: "URL de SonarQube; no es un secreto"
+        description: "URL pública de SonarQube; no es un secreto"
         required: false
         type: string
         default: ""
@@ -157,7 +157,14 @@ jobs:
       SONAR_HOST_URL: ${{ inputs.sonar_host_url }}
 
     steps:
+      - name: Report SonarQube status
+        if: ${{ env.SONAR_TOKEN == '' || env.SONAR_HOST_URL == '' }}
+        run: |
+          echo "SonarQube no configurado: se omite el análisis."
+          echo "Configura sonar_host_url y sonar_token para activarlo."
+
       - name: Checkout
+        if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' }}
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -167,13 +174,11 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: coverage-report
+          path: .
 
       - name: Run SonarQube analysis and Quality Gate
         if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' }}
         uses: SonarSource/sonarqube-scan-action@v7
-        env:
-          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ env.SONAR_HOST_URL }}
         with:
           args: >-
             -Dsonar.python.coverage.reportPaths=coverage.xml
@@ -190,13 +195,14 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Scan filesystem dependencies and IaC
-        uses: aquasecurity/trivy-action@v0.34.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
           scan-ref: .
           scanners: vuln,secret,misconfig
           severity: HIGH,CRITICAL
           exit-code: "1"
+          cache: "false"
 
   docker:
     name: "Phase 4 - Build, Scan & Publish Image"
@@ -244,11 +250,12 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Scan candidate container image
-        uses: aquasecurity/trivy-action@v0.34.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}:${{ env.IMMUTABLE_TAG }}
           severity: HIGH,CRITICAL
           exit-code: "1"
+          cache: "false"
 
       - name: Publish validated image
         run: |
@@ -314,7 +321,6 @@ jobs:
     needs: deploy
     timeout-minutes: 30
 
-    # Solo development: nunca ejecutar DAST automático contra production.
     if: ${{ inputs.image_tag == 'development' && inputs.dast_target_url != '' }}
 
     steps:
