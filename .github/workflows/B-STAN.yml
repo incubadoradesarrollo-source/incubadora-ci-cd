@@ -54,6 +54,7 @@ on:
 permissions:
   contents: read
   issues: write
+  security-events: write
 
 jobs:
   fast-checks:
@@ -134,7 +135,7 @@ jobs:
           path: coverage.xml
           if-no-files-found: ignore
           retention-days: 14
-          
+
   sonar:
     name: "Phase 3 - SonarQube Quality Gate"
     runs-on: ubuntu-latest
@@ -380,6 +381,25 @@ jobs:
             exit 1
           fi
 
+      - name: Generate Trivy filesystem SARIF
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln
+          severity: HIGH,CRITICAL
+          format: sarif
+          output: trivy-filesystem.sarif
+          limit-severities-for-sarif: true
+          exit-code: "0"
+          cache: "false"
+
+      - name: Upload Trivy filesystem findings to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-filesystem.sarif
+          category: trivy-filesystem
+
   docker:
     name: "Phase 4 - Build, Scan & Publish Image"
     runs-on: ubuntu-latest
@@ -425,13 +445,32 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Scan candidate container image
+      - name: Scan candidate container image with Trivy
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}:${{ env.IMMUTABLE_TAG }}
           severity: HIGH,CRITICAL
-          exit-code: "1"
+          format: sarif
+          output: trivy-image.sarif
+          limit-severities-for-sarif: true
+          exit-code: "0"
           cache: "false"
+
+      - name: Upload container findings to GitHub Security
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-image.sarif
+          category: trivy-container-image
+
+      - name: Block image publication if vulnerabilities exist
+        run: |
+          COUNT="$(jq '[.runs[].results[]?] | length' trivy-image.sarif)"
+
+          echo "Trivy encontró $COUNT hallazgos HIGH o CRITICAL en la imagen."
+
+          if [ "$COUNT" -gt 0 ]; then
+            exit 1
+          fi
 
       - name: Publish validated image
         run: |
@@ -513,6 +552,14 @@ jobs:
             -c 2
             -timeout 10
             -retries 1
+            -sarif-export nuclei.sarif
+
+      - name: Upload Nuclei findings to GitHub Security
+        if: ${{ always() && hashFiles('nuclei.sarif') != '' }}
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: nuclei.sarif
+          category: nuclei-dast
 
       - name: Validate load test script
         if: ${{ inputs.run_load_tests }}
