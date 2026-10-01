@@ -395,12 +395,6 @@ jobs:
           exit-code: "0"
           cache: "false"
 
-      - name: Upload Trivy filesystem findings to GitHub Security
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: trivy-filesystem.sarif
-          category: trivy-filesystem
-
   docker:
     name: "Phase 4 - Build, Scan & Publish Image"
     runs-on: ubuntu-latest
@@ -458,12 +452,6 @@ jobs:
           limit-severities-for-sarif: true
           exit-code: "0"
           cache: "false"
-
-      - name: Upload container findings to GitHub Security
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: trivy-image.sarif
-          category: trivy-container-image
 
       - name: Block image publication if vulnerabilities exist
         run: |
@@ -556,13 +544,6 @@ jobs:
             -timeout 10
             -retries 1
             -sarif-export nuclei.sarif
-
-      - name: Upload Nuclei findings to GitHub Security
-        if: ${{ always() && hashFiles('nuclei.sarif') != '' }}
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: nuclei.sarif
-          category: nuclei-dast
 
       - name: Validate load test script
         if: ${{ inputs.run_load_tests }}
