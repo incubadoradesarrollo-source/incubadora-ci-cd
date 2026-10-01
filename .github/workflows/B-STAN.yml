@@ -4,11 +4,9 @@ on:
   workflow_call:
     inputs:
       image_name:
-        description: "Imagen GHCR sin ghcr.io/"
         required: true
         type: string
       image_tag:
-        description: "Entorno: development o production"
         required: true
         type: string
       python_version:
@@ -20,11 +18,9 @@ on:
         type: string
         default: "./Dockerfile"
       healthcheck_url:
-        description: "URL pública no autenticada del health check"
         required: true
         type: string
       dast_target_url:
-        description: "URL base exclusiva de development para Nuclei y k6"
         required: false
         type: string
         default: ""
@@ -52,10 +48,8 @@ on:
         required: false
 
 permissions:
-  actions: read
   contents: read
   issues: write
-  security-events: write
 
 jobs:
   fast-checks:
@@ -148,11 +142,9 @@ jobs:
       SONAR_HOST_URL: ${{ secrets.sonar_host_url }}
 
     steps:
-      - name: Report SonarQube status
+      - name: Sonar not configured
         if: ${{ env.SONAR_TOKEN == '' || env.SONAR_HOST_URL == '' }}
-        run: |
-          echo "SonarQube no configurado: se omite el análisis."
-          echo "Configura sonar_host_url y sonar_token para activarlo."
+        run: echo "SonarQube no configurado."
 
       - name: Checkout
         if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' }}
@@ -167,8 +159,10 @@ jobs:
           name: coverage-report
           path: .
 
-      - name: Run SonarQube analysis and Quality Gate
+      - name: Run SonarQube analysis
+        id: sonar_scan
         if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' }}
+        continue-on-error: true
         uses: SonarSource/sonarqube-scan-action@v7
         with:
           args: >-
@@ -178,6 +172,35 @@ jobs:
             -Dsonar.exclusions=**/migrations/**,**/tests/**,**/.venv/**,**/venv/**
             -Dsonar.python.coverage.reportPaths=coverage.xml
             -Dsonar.qualitygate.wait=true
+
+      - name: Create or update SonarQube issue
+        if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SONAR_RESULT: ${{ steps.sonar_scan.outcome }}
+          SONAR_URL: ${{ secrets.sonar_host_url }}
+        run: |
+          TITLE="[Quality] SonarQube B-STAN Quality Gate"
+          BODY="## SonarQube Quality Gate
+
+          **Resultado:** \`$SONAR_RESULT\`
+
+          Revisa el reporte completo en: $SONAR_URL/dashboard?id=b-stan
+
+          Commit analizado: \`${{ github.sha }}\`"
+
+          NUMBER="$(gh issue list --state open --search "$TITLE in:title" \
+            --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n1)"
+
+          if [ -n "$NUMBER" ]; then
+            gh issue edit "$NUMBER" --title "$TITLE" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi
+
+      - name: Fail if SonarQube failed
+        if: ${{ env.SONAR_TOKEN != '' && env.SONAR_HOST_URL != '' && steps.sonar_scan.outcome == 'failure' }}
+        run: exit 1
 
   dependency-security:
     name: "Phase 3 - Dependency Security"
@@ -189,7 +212,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Scan filesystem dependencies and IaC
+      - name: Scan filesystem with Trivy
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           scan-type: fs
@@ -201,199 +224,42 @@ jobs:
           exit-code: "0"
           cache: "false"
 
-      - name: Upload Trivy report
-        if: ${{ always() }}
+      - name: Upload Trivy filesystem report
         uses: actions/upload-artifact@v4
         with:
           name: trivy-filesystem-report
           path: trivy-fs.json
-          if-no-files-found: ignore
           retention-days: 30
 
-      - name: Create or update GitHub vulnerability issues
-        if: ${{ always() }}
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require("fs");
-            const reportPath = `${process.env.GITHUB_WORKSPACE}/trivy-fs.json`;
-
-            if (!fs.existsSync(reportPath)) {
-              core.setFailed("No se encontró el reporte trivy-fs.json.");
-              return;
-            }
-
-            const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
-            const findings = new Map();
-
-            for (const result of report.Results || []) {
-              for (const vulnerability of result.Vulnerabilities || []) {
-                const packageName = vulnerability.PkgName || "unknown-package";
-
-                if (!findings.has(packageName)) {
-                  findings.set(packageName, {
-                    installedVersion: vulnerability.InstalledVersion || "desconocida",
-                    fixedVersions: new Set(),
-                    severities: new Set(),
-                    vulnerabilities: [],
-                  });
-                }
-
-                const item = findings.get(packageName);
-                item.severities.add(vulnerability.Severity || "UNKNOWN");
-
-                if (vulnerability.FixedVersion) {
-                  item.fixedVersions.add(vulnerability.FixedVersion);
-                }
-
-                item.vulnerabilities.push({
-                  id: vulnerability.VulnerabilityID || "N/A",
-                  severity: vulnerability.Severity || "UNKNOWN",
-                  title: vulnerability.Title || "Sin descripción",
-                  url: vulnerability.PrimaryURL || "",
-                });
-              }
-            }
-
-            if (findings.size === 0) {
-              core.info("Trivy no encontró vulnerabilidades HIGH ni CRITICAL.");
-              return;
-            }
-
-            const { owner, repo } = context.repo;
-
-            const requiredLabels = [
-              { name: "security", color: "d73a4a", description: "Hallazgo de seguridad" },
-              { name: "dependencies", color: "0366d6", description: "Actualización de dependencias" },
-              { name: "trivy", color: "5319e7", description: "Hallazgo generado por Trivy" },
-              { name: "critical", color: "b60205", description: "Severidad crítica" },
-              { name: "high", color: "fbca04", description: "Severidad alta" },
-            ];
-
-            for (const label of requiredLabels) {
-              try {
-                await github.rest.issues.getLabel({
-                  owner,
-                  repo,
-                  name: label.name,
-                });
-              } catch (error) {
-                if (error.status !== 404) throw error;
-
-                await github.rest.issues.createLabel({
-                  owner,
-                  repo,
-                  name: label.name,
-                  color: label.color,
-                  description: label.description,
-                });
-              }
-            }
-
-            const openIssues = await github.paginate(
-              github.rest.issues.listForRepo,
-              {
-                owner,
-                repo,
-                state: "open",
-                labels: "security,dependencies,trivy",
-                per_page: 100,
-              },
-            );
-
-            for (const [packageName, finding] of findings) {
-              const hasCritical = finding.severities.has("CRITICAL");
-              const severityLabel = hasCritical ? "critical" : "high";
-              const title = `[Security] Actualizar ${packageName} por vulnerabilidades detectadas por Trivy`;
-
-              const fixedVersions = finding.fixedVersions.size
-                ? [...finding.fixedVersions].join(", ")
-                : "No existe una versión corregida reportada";
-
-              const vulnerabilityRows = finding.vulnerabilities
-                .map((vulnerability) => {
-                  const id = vulnerability.url
-                    ? `[${vulnerability.id}](${vulnerability.url})`
-                    : vulnerability.id;
-
-                  return `| ${id} | ${vulnerability.severity} | ${vulnerability.title} |`;
-                })
-                .join("\n");
-
-              const body = `## Hallazgo automático de Trivy
-
-              **Paquete:** \`${packageName}\`  
-              **Versión instalada:** \`${finding.installedVersion}\`  
-              **Versión(es) corregida(s):** \`${fixedVersions}\`  
-              **Severidad máxima:** \`${hasCritical ? "CRITICAL" : "HIGH"}\`
-
-              ### Vulnerabilidades detectadas
-
-              | ID | Severidad | Descripción |
-              |---|---|---|
-              ${vulnerabilityRows}
-
-              ### Criterios de aceptación
-
-              - [ ] Actualizar \`${packageName}\` a una versión corregida y compatible.
-              - [ ] Ejecutar \`python manage.py test\`.
-              - [ ] Ejecutar nuevamente Trivy sin hallazgos HIGH o CRITICAL para este paquete.
-              - [ ] Cerrar este issue solo después de verificar el pipeline.
-
-              ---
-              _Actualizado automáticamente por Trivy en el commit ${context.sha}._`;
-
-              const existingIssue = openIssues.find(
-                (issue) => issue.title === title && !issue.pull_request,
-              );
-
-              if (existingIssue) {
-                await github.rest.issues.update({
-                  owner,
-                  repo,
-                  issue_number: existingIssue.number,
-                  title,
-                  body,
-                  labels: ["security", "dependencies", "trivy", severityLabel],
-                });
-                core.info(`Issue actualizado: #${existingIssue.number}`);
-              } else {
-                const created = await github.rest.issues.create({
-                  owner,
-                  repo,
-                  title,
-                  body,
-                  labels: ["security", "dependencies", "trivy", severityLabel],
-                });
-                core.info(`Issue creado: #${created.data.number}`);
-              }
-            }
-
-      - name: Block pipeline when HIGH or CRITICAL vulnerabilities exist
+      - name: Create or update Trivy dependency issue
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          test -f trivy-fs.json
-
           COUNT="$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-fs.json)"
+          TITLE="[Security] Trivy dependencies B-STAN"
+          ROWS="$(jq -r '
+            [.Results[]?.Vulnerabilities[]?] |
+            .[] |
+            "- \(.PkgName) \(.InstalledVersion) → \(.FixedVersion // "sin fix") | \(.Severity) | \(.VulnerabilityID)"
+          ' trivy-fs.json)"
 
-          echo "Trivy encontró $COUNT vulnerabilidades HIGH o CRITICAL."
+          BODY="## Trivy: dependencias e infraestructura
 
-          if [ "$COUNT" -gt 0 ]; then
-            echo "Los issues de GitHub fueron creados o actualizados."
-            exit 1
+          Hallazgos HIGH/CRITICAL: **$COUNT**
+
+          $ROWS
+
+          Artifact: \`trivy-filesystem-report\`
+          Commit: \`${{ github.sha }}\`"
+
+          NUMBER="$(gh issue list --state open --search "$TITLE in:title" \
+            --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n1)"
+
+          if [ -n "$NUMBER" ]; then
+            gh issue edit "$NUMBER" --title "$TITLE" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
           fi
-
-      - name: Generate Trivy filesystem SARIF
-        uses: aquasecurity/trivy-action@v0.36.0
-        with:
-          scan-type: fs
-          scan-ref: .
-          scanners: vuln
-          severity: HIGH,CRITICAL
-          format: sarif
-          output: trivy-filesystem.sarif
-          limit-severities-for-sarif: true
-          exit-code: "0"
-          cache: "false"
 
   docker:
     name: "Phase 4 - Build, Scan & Publish Image"
@@ -402,10 +268,9 @@ jobs:
     timeout-minutes: 30
 
     permissions:
-      actions: read
       contents: read
       packages: write
-      security-events: write
+      issues: write
 
     env:
       IMAGE: ghcr.io/${{ inputs.image_name }}
@@ -436,32 +301,59 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:${{ env.MUTABLE_TAG }}
             ${{ env.IMAGE }}:${{ env.IMMUTABLE_TAG }}
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
 
-      - name: Scan candidate container image with Trivy
+      - name: Scan image with Trivy
         uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: ${{ env.IMAGE }}:${{ env.IMMUTABLE_TAG }}
           severity: HIGH,CRITICAL
-          format: sarif
-          output: trivy-image.sarif
-          limit-severities-for-sarif: true
+          format: json
+          output: trivy-image.json
           exit-code: "0"
           cache: "false"
 
-      - name: Block image publication if vulnerabilities exist
+      - name: Upload Trivy image report
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-image-report
+          path: trivy-image.json
+          retention-days: 30
+
+      - name: Create or update container security issue
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          COUNT="$(jq '[.runs[].results[]?] | length' trivy-image.sarif)"
+          COUNT="$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-image.json)"
+          TITLE="[Security] Trivy image ${{ inputs.image_tag }} B-STAN"
+          ROWS="$(jq -r '
+            [.Results[]?.Vulnerabilities[]?] |
+            .[] |
+            "- \(.PkgName) \(.InstalledVersion) → \(.FixedVersion // "sin fix") | \(.Severity) | \(.VulnerabilityID)"
+          ' trivy-image.json)"
 
-          echo "Trivy encontró $COUNT hallazgos HIGH o CRITICAL en la imagen."
+          BODY="## Trivy: imagen Docker
 
-          if [ "$COUNT" -gt 0 ]; then
-            exit 1
+          Imagen: \`${IMAGE}:${IMMUTABLE_TAG}\`
+          Hallazgos HIGH/CRITICAL: **$COUNT**
+
+          $ROWS
+
+          Artifact: \`trivy-image-report\`
+          Commit: \`${{ github.sha }}\`"
+
+          NUMBER="$(gh issue list --state open --search "$TITLE in:title" \
+            --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n1)"
+
+          if [ -n "$NUMBER" ]; then
+            gh issue edit "$NUMBER" --title "$TITLE" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
           fi
+
+      - name: Block publication if image has vulnerabilities
+        run: |
+          COUNT="$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-image.json)"
+          test "$COUNT" -eq 0
 
       - name: Publish validated image
         run: |
@@ -469,63 +361,37 @@ jobs:
           docker push "$IMAGE:$IMMUTABLE_TAG"
 
   deploy:
-    name: "Phase 5 - Deploy ${{ inputs.image_tag }} in Coolify"
+    name: "Phase 5 - Deploy ${{ inputs.image_tag }}"
     runs-on: ubuntu-latest
     needs: docker
-    timeout-minutes: 15
-
-    concurrency:
-      group: coolify-stan-${{ inputs.image_tag }}
-      cancel-in-progress: false
 
     steps:
-      - name: Validate deployment configuration
-        env:
-          COOLIFY_WEBHOOK: ${{ secrets.coolify_webhook }}
-          COOLIFY_TOKEN: ${{ secrets.coolify_token }}
-        run: |
-          test -n "$COOLIFY_WEBHOOK"
-          test -n "$COOLIFY_TOKEN"
-
       - name: Trigger Coolify deployment
         env:
           COOLIFY_WEBHOOK: ${{ secrets.coolify_webhook }}
           COOLIFY_TOKEN: ${{ secrets.coolify_token }}
         run: |
           curl --fail --show-error --silent \
-            --retry 3 \
-            --retry-all-errors \
-            --connect-timeout 10 \
-            --max-time 60 \
             --request POST \
             "$COOLIFY_WEBHOOK" \
             --header "Authorization: Bearer $COOLIFY_TOKEN"
 
-      - name: Wait for deployed API health check
+      - name: Wait for API health check
         env:
           HEALTHCHECK_URL: ${{ inputs.healthcheck_url }}
         run: |
           for attempt in {1..30}; do
-            if curl --fail --show-error --silent \
-              --connect-timeout 5 \
-              --max-time 10 \
-              "$HEALTHCHECK_URL" > /dev/null; then
-              echo "API healthy after attempt $attempt."
+            if curl --fail --silent "$HEALTHCHECK_URL" > /dev/null; then
               exit 0
             fi
-
-            echo "Waiting for API... attempt $attempt/30"
             sleep 5
           done
-
-          echo "ERROR: API did not become healthy."
           exit 1
 
   dast-and-performance:
     name: "Phase 6 - DAST & Load Tests"
     runs-on: ubuntu-latest
     needs: deploy
-    timeout-minutes: 30
     if: ${{ inputs.image_tag == 'development' && inputs.dast_target_url != '' }}
 
     steps:
@@ -543,18 +409,74 @@ jobs:
             -c 2
             -timeout 10
             -retries 1
-            -sarif-export nuclei.sarif
+            -jsonl
+            -o nuclei.json
 
-      - name: Validate load test script
-        if: ${{ inputs.run_load_tests }}
+      - name: Upload Nuclei report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuclei-dast-report
+          path: nuclei.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Create or update Nuclei issue
+        if: ${{ always() && hashFiles('nuclei.json') != '' }}
         env:
-          LOAD_TEST_FILE: ${{ inputs.load_test_file }}
-        run: test -f "$LOAD_TEST_FILE"
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          COUNT="$(wc -l < nuclei.json)"
+          TITLE="[Security] Nuclei DAST B-STAN Development"
+          BODY="## Nuclei DAST
+
+          Objetivo: \`${{ inputs.dast_target_url }}\`
+          Hallazgos: **$COUNT**
+
+          Artifact: \`nuclei-dast-report\`
+          Commit: \`${{ github.sha }}\`"
+
+          NUMBER="$(gh issue list --state open --search "$TITLE in:title" \
+            --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n1)"
+
+          if [ -n "$NUMBER" ]; then
+            gh issue edit "$NUMBER" --title "$TITLE" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi
 
       - name: Run k6 load test
+        id: k6
         if: ${{ inputs.run_load_tests }}
+        continue-on-error: true
         uses: grafana/k6-action@v0.3.1
         with:
           filename: ${{ inputs.load_test_file }}
         env:
           TARGET_URL: ${{ inputs.dast_target_url }}
+
+      - name: Create or update k6 issue
+        if: ${{ inputs.run_load_tests }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          K6_RESULT: ${{ steps.k6.outcome }}
+        run: |
+          TITLE="[Performance] k6 B-STAN Development"
+          BODY="## k6 Load Test
+
+          Objetivo: \`${{ inputs.dast_target_url }}\`
+          Resultado: **$K6_RESULT**
+          Commit: \`${{ github.sha }}\`"
+
+          NUMBER="$(gh issue list --state open --search "$TITLE in:title" \
+            --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n1)"
+
+          if [ -n "$NUMBER" ]; then
+            gh issue edit "$NUMBER" --title "$TITLE" --body "$BODY"
+          else
+            gh issue create --title "$TITLE" --body "$BODY"
+          fi
+
+      - name: Fail if k6 failed
+        if: ${{ inputs.run_load_tests && steps.k6.outcome == 'failure' }}
+        run: exit 1
