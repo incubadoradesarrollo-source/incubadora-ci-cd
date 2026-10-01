@@ -7,50 +7,41 @@ on:
         description: "Imagen GHCR sin ghcr.io/"
         required: true
         type: string
-
       image_tag:
-        description: "Entorno de destino: development o production"
+        description: "Entorno: development o production"
         required: true
         type: string
-
       python_version:
         required: false
         type: string
         default: "3.14"
-
       dockerfile:
         required: false
         type: string
         default: "./Dockerfile"
-
       healthcheck_url:
         description: "URL pública no autenticada del health check"
         required: true
         type: string
-
       dast_target_url:
         description: "URL base exclusiva de development para Nuclei y k6"
         required: false
         type: string
         default: ""
-
       load_test_file:
         required: false
         type: string
         default: "tests/load/k6-script.js"
-
       run_load_tests:
         required: false
         type: boolean
         default: false
-
       minimum_coverage:
         required: false
         type: number
         default: 0
-
       sonar_host_url:
-        description: "URL pública de SonarQube; no es un secreto"
+        description: "URL pública de SonarQube"
         required: false
         type: string
         default: ""
@@ -65,6 +56,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   fast-checks:
@@ -201,8 +193,191 @@ jobs:
           scan-ref: .
           scanners: vuln,secret,misconfig
           severity: HIGH,CRITICAL
-          exit-code: "1"
+          format: json
+          output: trivy-fs.json
+          exit-code: "0"
           cache: "false"
+
+      - name: Upload Trivy report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-filesystem-report
+          path: trivy-fs.json
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Create or update GitHub vulnerability issues
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const reportPath = `${process.env.GITHUB_WORKSPACE}/trivy-fs.json`;
+
+            if (!fs.existsSync(reportPath)) {
+              core.setFailed("No se encontró el reporte trivy-fs.json.");
+              return;
+            }
+
+            const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
+            const findings = new Map();
+
+            for (const result of report.Results || []) {
+              for (const vulnerability of result.Vulnerabilities || []) {
+                const packageName = vulnerability.PkgName || "unknown-package";
+
+                if (!findings.has(packageName)) {
+                  findings.set(packageName, {
+                    installedVersion: vulnerability.InstalledVersion || "desconocida",
+                    fixedVersions: new Set(),
+                    severities: new Set(),
+                    vulnerabilities: [],
+                  });
+                }
+
+                const item = findings.get(packageName);
+                item.severities.add(vulnerability.Severity || "UNKNOWN");
+
+                if (vulnerability.FixedVersion) {
+                  item.fixedVersions.add(vulnerability.FixedVersion);
+                }
+
+                item.vulnerabilities.push({
+                  id: vulnerability.VulnerabilityID || "N/A",
+                  severity: vulnerability.Severity || "UNKNOWN",
+                  title: vulnerability.Title || "Sin descripción",
+                  url: vulnerability.PrimaryURL || "",
+                });
+              }
+            }
+
+            if (findings.size === 0) {
+              core.info("Trivy no encontró vulnerabilidades HIGH ni CRITICAL.");
+              return;
+            }
+
+            const { owner, repo } = context.repo;
+
+            const requiredLabels = [
+              { name: "security", color: "d73a4a", description: "Hallazgo de seguridad" },
+              { name: "dependencies", color: "0366d6", description: "Actualización de dependencias" },
+              { name: "trivy", color: "5319e7", description: "Hallazgo generado por Trivy" },
+              { name: "critical", color: "b60205", description: "Severidad crítica" },
+              { name: "high", color: "fbca04", description: "Severidad alta" },
+            ];
+
+            for (const label of requiredLabels) {
+              try {
+                await github.rest.issues.getLabel({
+                  owner,
+                  repo,
+                  name: label.name,
+                });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+
+                await github.rest.issues.createLabel({
+                  owner,
+                  repo,
+                  name: label.name,
+                  color: label.color,
+                  description: label.description,
+                });
+              }
+            }
+
+            const openIssues = await github.paginate(
+              github.rest.issues.listForRepo,
+              {
+                owner,
+                repo,
+                state: "open",
+                labels: "security,dependencies,trivy",
+                per_page: 100,
+              },
+            );
+
+            for (const [packageName, finding] of findings) {
+              const hasCritical = finding.severities.has("CRITICAL");
+              const severityLabel = hasCritical ? "critical" : "high";
+              const title = `[Security] Actualizar ${packageName} por vulnerabilidades detectadas por Trivy`;
+
+              const fixedVersions = finding.fixedVersions.size
+                ? [...finding.fixedVersions].join(", ")
+                : "No existe una versión corregida reportada";
+
+              const vulnerabilityRows = finding.vulnerabilities
+                .map((vulnerability) => {
+                  const id = vulnerability.url
+                    ? `[${vulnerability.id}](${vulnerability.url})`
+                    : vulnerability.id;
+
+                  return `| ${id} | ${vulnerability.severity} | ${vulnerability.title} |`;
+                })
+                .join("\n");
+
+              const body = `## Hallazgo automático de Trivy
+
+**Paquete:** \`${packageName}\`  
+**Versión instalada:** \`${finding.installedVersion}\`  
+**Versión(es) corregida(s):** \`${fixedVersions}\`  
+**Severidad máxima:** \`${hasCritical ? "CRITICAL" : "HIGH"}\`
+
+### Vulnerabilidades detectadas
+
+| ID | Severidad | Descripción |
+|---|---|---|
+${vulnerabilityRows}
+
+### Criterios de aceptación
+
+- [ ] Actualizar \`${packageName}\` a una versión corregida y compatible.
+- [ ] Ejecutar \`python manage.py test\`.
+- [ ] Ejecutar nuevamente Trivy sin hallazgos HIGH o CRITICAL para este paquete.
+- [ ] Cerrar este issue solo después de verificar el pipeline.
+
+---
+_Actualizado automáticamente por Trivy en el commit ${context.sha}._`;
+
+              const existingIssue = openIssues.find(
+                (issue) => issue.title === title && !issue.pull_request,
+              );
+
+              if (existingIssue) {
+                await github.rest.issues.update({
+                  owner,
+                  repo,
+                  issue_number: existingIssue.number,
+                  title,
+                  body,
+                  labels: ["security", "dependencies", "trivy", severityLabel],
+                });
+                core.info(`Issue actualizado: #${existingIssue.number}`);
+              } else {
+                const created = await github.rest.issues.create({
+                  owner,
+                  repo,
+                  title,
+                  body,
+                  labels: ["security", "dependencies", "trivy", severityLabel],
+                });
+                core.info(`Issue creado: #${created.data.number}`);
+              }
+            }
+
+      - name: Block pipeline when HIGH or CRITICAL vulnerabilities exist
+        run: |
+          test -f trivy-fs.json
+
+          COUNT="$(jq '[.Results[]?.Vulnerabilities[]?] | length' trivy-fs.json)"
+
+          echo "Trivy encontró $COUNT vulnerabilidades HIGH o CRITICAL."
+
+          if [ "$COUNT" -gt 0 ]; then
+            echo "Los issues de GitHub fueron creados o actualizados."
+            exit 1
+          fi
 
   docker:
     name: "Phase 4 - Build, Scan & Publish Image"
@@ -320,7 +495,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: deploy
     timeout-minutes: 30
-
     if: ${{ inputs.image_tag == 'development' && inputs.dast_target_url != '' }}
 
     steps:
