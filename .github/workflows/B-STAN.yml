@@ -393,51 +393,116 @@ jobs:
     runs-on: ubuntu-latest
     needs: deploy
     if: ${{ inputs.image_tag == 'development' && inputs.dast_target_url != '' }}
+    timeout-minutes: 25
+
+    permissions:
+      contents: read
+      issues: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: DAST with Nuclei
-        uses: projectdiscovery/nuclei-action@main
+      - name: Install Nuclei
+        uses: projectdiscovery/nuclei-action@v3
         with:
-          target: ${{ inputs.dast_target_url }}
-          flags: >-
-            -tags headers,exposure,misconfig,cve
-            -severity medium,high,critical
-            -rl 5
-            -c 2
-            -timeout 10
-            -retries 1
-            -jsonl
-            -o nuclei.json
+          version: v3.11.1
+          install-only: true
+          cache: true
+
+      - name: Prepare DAST report
+        run: |
+          mkdir -p reports
+          : > reports/nuclei.jsonl
+
+      - name: Run Nuclei DAST
+        id: nuclei
+        continue-on-error: true
+        env:
+          DAST_TARGET_URL: ${{ inputs.dast_target_url }}
+        run: |
+          set +e
+
+          timeout --signal=TERM --kill-after=30s 15m \
+            nuclei \
+              -u "$DAST_TARGET_URL" \
+              -tags exposure,misconfig,headers \
+              -severity medium,high,critical \
+              -rl 3 \
+              -c 1 \
+              -timeout 8 \
+              -retries 0 \
+              -ni \
+              -omit-raw \
+              -jsonl-export reports/nuclei.jsonl \
+              -silent
+
+          EXIT_CODE=$?
+
+          if [ "$EXIT_CODE" -eq 0 ]; then
+            echo "status=completed" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$EXIT_CODE" -eq 124 ]; then
+            echo "status=timed_out_after_15_minutes" >> "$GITHUB_OUTPUT"
+            echo "Nuclei alcanzó el límite interno de 15 minutos."
+            exit 0
+          fi
+
+          echo "status=failed_exit_code_$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          exit "$EXIT_CODE"
 
       - name: Upload Nuclei report
         if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: nuclei-dast-report
-          path: nuclei.json
-          if-no-files-found: ignore
+          path: reports/nuclei.jsonl
+          if-no-files-found: warn
           retention-days: 30
 
       - name: Create or update Nuclei issue
-        if: ${{ always() && hashFiles('nuclei.json') != '' }}
+        if: ${{ always() }}
         env:
           GH_TOKEN: ${{ github.token }}
+          NUCLEI_STATUS: ${{ steps.nuclei.outputs.status }}
+          DAST_TARGET_URL: ${{ inputs.dast_target_url }}
+          COMMIT_SHA: ${{ github.sha }}
         run: |
-          COUNT="$(wc -l < nuclei.json)"
+          COUNT="$(wc -l < reports/nuclei.jsonl | tr -d ' ')"
+
+          ROWS="$(
+            jq -r '
+              [
+                .["template-id"],
+                (.info.severity // "unknown"),
+                (.info.name // "Unnamed finding")
+              ] | "- `\(.[0])` | \(.[1]) | \(.[2])"
+            ' reports/nuclei.jsonl 2>/dev/null | sed -n '1,50p'
+          )"
+
+          if [ -z "$ROWS" ]; then
+            ROWS="Sin hallazgos reportados."
+          fi
+
           TITLE="[Security] Nuclei DAST B-STAN Development"
           BODY="## Nuclei DAST
 
-          Objetivo: \`${{ inputs.dast_target_url }}\`
+          Objetivo: \`$DAST_TARGET_URL\`
+          Estado: **${NUCLEI_STATUS:-not_started}**
           Hallazgos: **$COUNT**
 
+          ### Primeros hallazgos
+
+          $ROWS
+
           Artifact: \`nuclei-dast-report\`
-          Commit: \`${{ github.sha }}\`"
+          Commit: \`$COMMIT_SHA\`"
 
           NUMBER="$(gh issue list --state open --search "$TITLE in:title" \
-            --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n1)"
+            --json number,title \
+            --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n1)"
 
           if [ -n "$NUMBER" ]; then
             gh issue edit "$NUMBER" --title "$TITLE" --body "$BODY"
@@ -469,7 +534,8 @@ jobs:
           Commit: \`${{ github.sha }}\`"
 
           NUMBER="$(gh issue list --state open --search "$TITLE in:title" \
-            --json number,title --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n1)"
+            --json number,title \
+            --jq ".[] | select(.title == \"$TITLE\") | .number" | head -n1)"
 
           if [ -n "$NUMBER" ]; then
             gh issue edit "$NUMBER" --title "$TITLE" --body "$BODY"
